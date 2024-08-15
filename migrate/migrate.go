@@ -103,37 +103,85 @@ func NewMigratorEx(ctx context.Context, conn *pgx.Conn, versionTable string, opt
 	return
 }
 
-// FindMigrations finds all migration files in fsys.
-func FindMigrations(fsys fs.FS) ([]string, error) {
-	fileInfos, err := fs.ReadDir(fsys, ".")
-	if err != nil {
-		return nil, err
+func FindMigrationsV2(fsys []fs.FS) ([]string, []fs.FS, error) {
+	paths := make([]string, 0, len(fsys)*5)
+	paths_fsys_map := make([]fs.FS, 0, len(fsys)*5)
+
+	for _, f := range fsys {
+		fileInfos, err := fs.ReadDir(f, ".")
+		if err != nil {
+			return nil, nil, err
+		}
+
+		for _, fi := range fileInfos {
+			if fi.IsDir() {
+				continue
+			}
+
+			matches := migrationPattern.FindStringSubmatch(fi.Name())
+			if len(matches) != 2 {
+				continue
+			}
+
+			n, err := strconv.ParseInt(matches[1], 10, 32)
+			if err != nil {
+				// The regexp already validated that the prefix is all digits so this *should* never fail
+				return nil, nil, err
+			}
+
+			if n-1 < int64(len(paths)) && paths[n-1] != "" {
+				return nil, nil, fmt.Errorf("Duplicate migration %d", n)
+			}
+
+			// Set at specific index, so that paths are properly sorted
+			paths = setAt(paths, fi.Name(), n-1)
+			paths_fsys_map = setAt(paths_fsys_map, f, n-1)
+
+		}
 	}
 
-	paths := make([]string, 0, len(fileInfos))
-
-	for _, fi := range fileInfos {
-		if fi.IsDir() {
-			continue
+	for i, path := range paths {
+		if path == "" {
+			return nil, nil, fmt.Errorf("Missing migration %d", i+1)
 		}
+	}
 
-		matches := migrationPattern.FindStringSubmatch(fi.Name())
-		if len(matches) != 2 {
-			continue
-		}
+	return paths, paths_fsys_map, nil
+}
 
-		n, err := strconv.ParseInt(matches[1], 10, 32)
+// FindMigrations finds all migration files in fsys.
+func FindMigrations(fsys []fs.FS) ([]string, error) {
+	paths := make([]string, 0, len(fsys)*5)
+
+	for _, f := range fsys {
+		fileInfos, err := fs.ReadDir(f, ".")
 		if err != nil {
-			// The regexp already validated that the prefix is all digits so this *should* never fail
 			return nil, err
 		}
 
-		if n-1 < int64(len(paths)) && paths[n-1] != "" {
-			return nil, fmt.Errorf("Duplicate migration %d", n)
-		}
+		for _, fi := range fileInfos {
+			if fi.IsDir() {
+				continue
+			}
 
-		// Set at specific index, so that paths are properly sorted
-		paths = setAt(paths, fi.Name(), n-1)
+			matches := migrationPattern.FindStringSubmatch(fi.Name())
+			if len(matches) != 2 {
+				continue
+			}
+
+			n, err := strconv.ParseInt(matches[1], 10, 32)
+			if err != nil {
+				// The regexp already validated that the prefix is all digits so this *should* never fail
+				return nil, err
+			}
+
+			if n-1 < int64(len(paths)) && paths[n-1] != "" {
+				return nil, fmt.Errorf("Duplicate migration %d", n)
+			}
+
+			// Set at specific index, so that paths are properly sorted
+			paths = setAt(paths, fi.Name(), n-1)
+		}
 	}
 
 	for i, path := range paths {
@@ -145,42 +193,48 @@ func FindMigrations(fsys fs.FS) ([]string, error) {
 	return paths, nil
 }
 
-func (m *Migrator) LoadMigrations(fsys fs.FS) error {
-	mainTmpl := template.New("main").Funcs(sprig.TxtFuncMap()).Funcs(
-		template.FuncMap{
-			"install_snapshot": func(name string) (string, error) {
-				codePackageFSys, err := fs.Sub(fsys, filepath.Join("snapshots", name))
-				if err != nil {
-					return "", err
-				}
-				codePackage, err := LoadCodePackage(codePackageFSys)
-				if err != nil {
-					return "", err
-				}
+func (m *Migrator) LoadMigrations(fsys []fs.FS) error {
+	tmpl_map := make(map[fs.FS]*template.Template)
 
-				return codePackage.Eval(m.Data)
+	for _, f := range fsys {
+		mainTmpl := template.New("main").Funcs(sprig.TxtFuncMap()).Funcs(
+			template.FuncMap{
+				"install_snapshot": func(name string) (string, error) {
+					codePackageFSys, err := fs.Sub(f, filepath.Join("snapshots", name))
+					if err != nil {
+						return "", err
+					}
+					codePackage, err := LoadCodePackage(codePackageFSys)
+					if err != nil {
+						return "", err
+					}
+
+					return codePackage.Eval(m.Data)
+				},
 			},
-		},
-	)
+		)
 
-	sharedPaths, err := fs.Glob(fsys, filepath.Join("*", "*.sql"))
-	if err != nil {
-		return err
-	}
-
-	for _, p := range sharedPaths {
-		body, err := fs.ReadFile(fsys, p)
+		sharedPaths, err := fs.Glob(f, filepath.Join("*", "*.sql"))
 		if err != nil {
 			return err
 		}
 
-		_, err = mainTmpl.New(p).Parse(string(body))
-		if err != nil {
-			return err
+		for _, p := range sharedPaths {
+			body, err := fs.ReadFile(f, p)
+			if err != nil {
+				return err
+			}
+
+			_, err = mainTmpl.New(p).Parse(string(body))
+			if err != nil {
+				return err
+			}
 		}
+		tmpl_map[f] = mainTmpl
+
 	}
 
-	paths, err := FindMigrations(fsys)
+	paths, paths_fsys_map, err := FindMigrationsV2(fsys)
 	if err != nil {
 		return err
 	}
@@ -189,8 +243,9 @@ func (m *Migrator) LoadMigrations(fsys fs.FS) error {
 		return NoMigrationsFoundError{}
 	}
 
-	for _, p := range paths {
-		body, err := fs.ReadFile(fsys, p)
+	for i, p := range paths {
+		f := paths_fsys_map[i]
+		body, err := fs.ReadFile(f, p)
 		if err != nil {
 			return err
 		}
@@ -198,6 +253,7 @@ func (m *Migrator) LoadMigrations(fsys fs.FS) error {
 		pieces := strings.SplitN(string(body), "---- create above / drop below ----", 2)
 		var upSQL, downSQL string
 		upSQL = strings.TrimSpace(pieces[0])
+		mainTmpl := tmpl_map[f]
 		upSQL, err = m.evalMigration(mainTmpl.New(filepath.Base(p)+" up"), upSQL)
 		if err != nil {
 			return err
@@ -433,10 +489,10 @@ func (m *Migrator) versionTableExists(ctx context.Context) (ok bool, err error) 
 	return count > 0, err
 }
 
-func setAt(strs []string, value string, pos int64) []string {
+func setAt[T any](strs []T, value T, pos int64) []T {
 	// If pos > length - 1, append empty strings to make it the right size
 	if pos > int64(len(strs))-1 {
-		strs = append(strs, make([]string, 1+pos-int64(len(strs)))...)
+		strs = append(strs, make([]T, 1+pos-int64(len(strs)))...)
 	}
 	strs[pos] = value
 	return strs

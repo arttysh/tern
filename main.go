@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -58,6 +59,14 @@ var defaultConf = `[database]
 # user =
 # password is not required if using SSH agent authentication
 # password =
+# multi_migration_paths = true
+
+# [migration_paths]
+# tern_main is the main migration_path that would represent -p parameter in the
+# tern command
+# tern_main = ./migrations
+# auth = ./migrations/auth
+# demo = ./demo/migrations
 
 [data]
 # Any fields in the data section are available in migration templates
@@ -93,14 +102,20 @@ type Config struct {
 	VersionTable  string
 	Data          map[string]interface{}
 	SSHConnConfig SSHConnConfig
+	MigrationMods map[string]string
 }
 
 var cliOptions struct {
 	destinationVersion string
-	migrationsPath     string
-	configPaths        []string
-	editNewMigration   bool
-	gengenOutputFile   string
+
+	// migrationsPath = {
+	//      migration module name,                      if len(Config.MigrationMods) > 0
+	//      path of direcotry containing migrations,    else
+	// }
+	migrationsPath   string
+	configPaths      []string
+	editNewMigration bool
+	gengenOutputFile string
 
 	connString   string
 	host         string
@@ -430,6 +445,12 @@ func NewMigration(cmd *cobra.Command, args []string) {
 
 	name := args[0]
 
+	config, err := LoadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading config:\n  %v\n", err)
+		os.Exit(1)
+	}
+
 	// If no migrations path was set in CLI argument look in environment.
 	if cliOptions.migrationsPath == "" {
 		cliOptions.migrationsPath = os.Getenv("TERN_MIGRATIONS")
@@ -440,8 +461,33 @@ func NewMigration(cmd *cobra.Command, args []string) {
 		cliOptions.migrationsPath = "."
 	}
 
+	isMulti := len(config.MigrationMods) > 0 || false
+
+	// TODO: combine getting mod_path and creating fsys to pass into FindMigrations
+	if isMulti {
+		if mod_path, ok := config.MigrationMods[cliOptions.migrationsPath]; ok {
+			cliOptions.migrationsPath = mod_path
+		} else {
+			// TODO: reword module
+			fmt.Fprintf(os.Stderr, "Migration path for module \"%v\" not found\n", cliOptions.migrationsPath)
+			os.Exit(1)
+		}
+	}
+
 	migrationsPath := cliOptions.migrationsPath
-	migrations, err := migrate.FindMigrations(os.DirFS(migrationsPath))
+
+	var migrations []string
+	var fsys_list []fs.FS
+
+	if isMulti {
+		for _, path := range config.MigrationMods {
+			fsys_list = append(fsys_list, os.DirFS(path))
+		}
+	} else {
+		fsys_list = append(fsys_list, os.DirFS(migrationsPath))
+	}
+	migrations, _, err = migrate.FindMigrationsV2(fsys_list)
+
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading migrations:\n  %v\n", err)
 		os.Exit(1)
@@ -517,8 +563,16 @@ func Migrate(cmd *cobra.Command, args []string) {
 	}
 	migrator.Data = config.Data
 
-	migrationsPath := cliOptions.migrationsPath
-	err = migrator.LoadMigrations(os.DirFS(migrationsPath))
+	isMulti := len(config.MigrationMods) > 0 || false
+	var fsys []fs.FS
+	if isMulti {
+		for _, path := range config.MigrationMods {
+			fsys = append(fsys, os.DirFS(path))
+		}
+	} else {
+		fsys = []fs.FS{os.DirFS(cliOptions.migrationsPath)}
+	}
+	err = migrator.LoadMigrations(fsys)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading migrations:\n  %v\n", err)
 		os.Exit(1)
@@ -622,8 +676,16 @@ func Gengen(cmd *cobra.Command, args []string) {
 	}
 	migrator.Data = config.Data
 
-	migrationsPath := cliOptions.migrationsPath
-	err = migrator.LoadMigrations(os.DirFS(migrationsPath))
+	isMulti := len(config.MigrationMods) > 0 || false
+	var fsys []fs.FS
+	if isMulti {
+		for _, path := range config.MigrationMods {
+			fsys = append(fsys, os.DirFS(path))
+		}
+	} else {
+		fsys = []fs.FS{os.DirFS(cliOptions.migrationsPath)}
+	}
+	err = migrator.LoadMigrations(fsys)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading migrations:\n  %v\n", err)
 		os.Exit(1)
@@ -800,7 +862,7 @@ func SnapshotCode(cmd *cobra.Command, args []string) {
 		migrationsPath = os.Getenv("TERN_MIGRATIONS")
 	}
 
-	migrations, err := migrate.FindMigrations(os.DirFS(migrationsPath))
+	migrations, err := migrate.FindMigrations([]fs.FS{os.DirFS(migrationsPath)})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading migrations:\n  %v\n", err)
 		os.Exit(1)
@@ -873,8 +935,16 @@ func Status(cmd *cobra.Command, args []string) {
 	}
 	migrator.Data = config.Data
 
-	migrationsPath := cliOptions.migrationsPath
-	err = migrator.LoadMigrations(os.DirFS(migrationsPath))
+	isMulti := len(config.MigrationMods) > 0 || false
+	var fsys []fs.FS
+	if isMulti {
+		for _, path := range config.MigrationMods {
+			fsys = append(fsys, os.DirFS(path))
+		}
+	} else {
+		fsys = []fs.FS{os.DirFS(cliOptions.migrationsPath)}
+	}
+	err = migrator.LoadMigrations(fsys)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading migrations:\n  %v\n", err)
 		os.Exit(1)
@@ -906,7 +976,7 @@ func Status(cmd *cobra.Command, args []string) {
 
 func RenumberStart(cmd *cobra.Command, args []string) {
 	migrationsPath := cliOptions.migrationsPath
-	migrations, err := migrate.FindMigrations(os.DirFS(migrationsPath))
+	migrations, err := migrate.FindMigrations([]fs.FS{os.DirFS(migrationsPath)})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading migrations:\n  %v\n", err)
 		os.Exit(1)
@@ -1056,8 +1126,9 @@ func findMigrationsForRenumber(path string) ([]string, error) {
 
 func LoadConfig() (*Config, error) {
 	config := &Config{
-		VersionTable: "public.schema_version",
-		Data:         make(map[string]interface{}),
+		VersionTable:  "public.schema_version",
+		Data:          make(map[string]interface{}),
+		MigrationMods: make(map[string]string),
 	}
 	if connConfig, err := pgx.ParseConfig(""); err == nil {
 		config.ConnConfig = *connConfig
@@ -1196,6 +1267,14 @@ func appendConfigFromFile(config *Config, path string) error {
 
 	for key, value := range file["data"] {
 		config.Data[key] = value
+	}
+
+	if multi, ok := file.Get("migration_paths", "multi"); ok && multi == "true" {
+		if paths, ok := file["migration_paths.paths"]; ok {
+			for k, v := range paths {
+				config.MigrationMods[k] = v
+			}
+		}
 	}
 
 	if host, ok := file.Get("ssh-tunnel", "host"); ok {
